@@ -101,6 +101,7 @@
 #define WIN32_LEAN_AND_MEAN 1
 #endif
 #include <windows.h>
+#include <bluetoothapis.h>
 #endif
 #ifdef WIIUSE_BLUEZ
 /* nix */
@@ -744,6 +745,8 @@ typedef struct wiimote_t
 #ifdef WIIUSE_WIN32
     /** @name Windows-specific members */
     /** @{ */
+    BLUETOOTH_DEVICE_INFO btdi; /**< bluetooth infos					*/
+    HANDLE radio_handle;        /**< radio handle						*/
     HANDLE dev_handle;         /**< HID handle								*/
     OVERLAPPED hid_overlap;    /**< overlap handle							*/
     enum win_bt_stack_t stack; /**< type of bluetooth stack to use			*/

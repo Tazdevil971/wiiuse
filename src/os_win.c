@@ -42,6 +42,12 @@
 
 #include <hidsdi.h>
 #include <setupapi.h>
+#include <bluetoothapis.h>
+
+#include <initguid.h> // Devpkey.h
+#include <Devpkey.h>  // DEVPKEY_Device_Parent
+
+#include <wchar.h> // wcsstr, wcscmp, ...
 
 #ifdef __MINGW32__
 /* this prototype is missing from the mingw headers so we must add it
@@ -59,145 +65,271 @@ static int clock_gettime(int X, struct timeval *tv);
 
 int wiiuse_os_find(struct wiimote_t **wm, int max_wiimotes, int timeout)
 {
-    GUID device_id;
-    HANDLE dev;
-    HDEVINFO device_info;
-    int i, index;
-    DWORD len;
-    SP_DEVICE_INTERFACE_DATA device_data;
-    PSP_DEVICE_INTERFACE_DETAIL_DATA detail_data = NULL;
-    HIDD_ATTRIBUTES attr;
-    int found = 0;
+    BLUETOOTH_FIND_RADIO_PARAMS radio_params;
+    BLUETOOTH_DEVICE_SEARCH_PARAMS device_params;
+    HBLUETOOTH_RADIO_FIND radio_enumerator;
+    HBLUETOOTH_DEVICE_FIND device_enumerator;
+    BLUETOOTH_DEVICE_INFO btdi;
+    HANDLE radio_handle;
+    HANDLE process_handle;
+    HANDLE clone_radio_handle;
+    WIIUSE_WIIMOTE_TYPE wiimote_type;
+    const char *wiimote_type_str;
+    char wiimote_addr_str[18]; // 12 digits + 5 colons + terminator
 
-    (void)timeout; /* unused */
+    int i;
+    int wiimotes_count = 0;
 
-    device_data.cbSize = sizeof(device_data);
-    index              = 0;
+    process_handle = GetCurrentProcess();
 
-    /* get the device id */
-    HidD_GetHidGuid(&device_id);
+    device_params.dwSize               = sizeof(BLUETOOTH_DEVICE_SEARCH_PARAMS);
+    device_params.fReturnAuthenticated = TRUE;
+    device_params.fReturnConnected     = FALSE;
+    device_params.fReturnUnknown       = TRUE;
+    device_params.cTimeoutMultiplier   = (UCHAR)timeout;
 
-    /* get all hid devices connected */
-    device_info = SetupDiGetClassDevs(&device_id, NULL, NULL, (DIGCF_DEVICEINTERFACE | DIGCF_PRESENT));
+    radio_params.dwSize = sizeof(BLUETOOTH_FIND_RADIO_PARAMS);
 
-    for (;; ++index)
+    btdi.dwSize = sizeof(BLUETOOTH_DEVICE_INFO);
+
+    // We have to do two iterations because (for some reason) we cannot connect
+    // to a remembered bluetooth device, so we first need to forget all of them.
+    // Also remembered devices may not be visible, but only rememebered
+    for (i = 0; i < 2; i++)
     {
-
-        if (detail_data)
-        {
-            free(detail_data);
-            detail_data = NULL;
-        }
-
-        /* query the next hid device info */
-        if (!SetupDiEnumDeviceInterfaces(device_info, NULL, &device_id, index, &device_data))
-        {
-            break;
-        }
-
-        /* get the size of the data block required */
-        i                   = SetupDiGetDeviceInterfaceDetail(device_info, &device_data, NULL, 0, &len, NULL);
-        detail_data         = (SP_DEVICE_INTERFACE_DETAIL_DATA_A *)malloc(len);
-        detail_data->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
-
-        /* query the data for this device */
-        if (!SetupDiGetDeviceInterfaceDetail(device_info, &device_data, detail_data, len, NULL, NULL))
-        {
-            continue;
-        }
-
-        /* open the device */
-        dev = CreateFile(detail_data->DevicePath, (GENERIC_READ | GENERIC_WRITE),
-                         (FILE_SHARE_READ | FILE_SHARE_WRITE), NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED,
-                         NULL);
-        if (dev == INVALID_HANDLE_VALUE)
-        {
-            continue;
-        }
-
-        /* get device attributes */
-        attr.Size = sizeof(attr);
-        i         = HidD_GetAttributes(dev, &attr);
-
-        if ((attr.VendorID == WM_VENDOR_ID)
-            && ((attr.ProductID == WM_PRODUCT_ID) || (attr.ProductID == WM_PRODUCT_ID_TR)))
-        {
-            /* this is a wiimote */
-            wm[found]->dev_handle = dev;
-
-            if (attr.ProductID == WM_PRODUCT_ID_TR)
-                wm[found]->type = WIIUSE_WIIMOTE_MOTION_PLUS_INSIDE;
-
-            wm[found]->hid_overlap.hEvent     = CreateEvent(NULL, 1, 1, "");
-            wm[found]->hid_overlap.Offset     = 0;
-            wm[found]->hid_overlap.OffsetHigh = 0;
-
-            WIIMOTE_ENABLE_STATE(wm[found], WIIMOTE_STATE_DEV_FOUND);
-            WIIMOTE_ENABLE_STATE(wm[found], WIIMOTE_STATE_CONNECTED);
-
-            /* try to set the output report to see if the device is actually connected */
-            if (!wiiuse_set_report_type(wm[found]))
-            {
-                WIIMOTE_DISABLE_STATE(wm[found], WIIMOTE_STATE_CONNECTED);
-                continue;
-            }
-
-            /* do the handshake */
-            wiiuse_handshake(wm[found], NULL, 0);
-
-            WIIUSE_INFO("Connected to wiimote [id %i].", wm[found]->unid);
-
-            ++found;
-            if (found >= max_wiimotes)
-            {
-                break;
-            }
+        if (i == 0)
+        { // The first time we do not need a full inquiry
+            device_params.fReturnRemembered = TRUE;
+            device_params.fIssueInquiry     = FALSE;
         } else
         {
-            /* not a wiimote */
-            CloseHandle(dev);
+            device_params.fReturnRemembered = FALSE;
+            device_params.fIssueInquiry     = TRUE;
         }
+
+        radio_enumerator = BluetoothFindFirstRadio(&radio_params, &radio_handle);
+        if (radio_enumerator == NULL)
+        {
+            WIIUSE_ERROR("Could not detect a Bluetooth adapter!");
+            return 0;
+        }
+
+        do
+        {
+            device_enumerator = BluetoothFindFirstDevice(&device_params, &btdi);
+            if (device_enumerator == NULL)
+                continue;
+
+            do
+            {
+                // Bug #1: windows doesn't properly filter the devices, so we need check for ourself
+                // Bug #2: this is not a correct boolean, in fact this is 32 for true and 0 for false
+                if (btdi.fConnected)
+                    continue;
+
+                if (wcscmp(btdi.szName, WM_LONG_NAME) == 0)
+                {
+                    wiimote_type     = WIIUSE_WIIMOTE_REGULAR;
+                    wiimote_type_str = " (regular wiimote)";
+
+                } else if (wcscmp(btdi.szName, WM_LONG_NAME_TR) == 0)
+                {
+                    wiimote_type     = WIIUSE_WIIMOTE_MOTION_PLUS_INSIDE;
+                    wiimote_type_str = " (motion plus inside)";
+
+                } else
+                {
+                    continue;
+                }
+
+                // This is a wiimote
+
+                if (i == 0)
+                {
+                    BluetoothRemoveDevice(&btdi.Address);
+                } else
+                {
+                    snprintf(wiimote_addr_str, sizeof(wiimote_addr_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                             btdi.Address.rgBytes[5], btdi.Address.rgBytes[4], btdi.Address.rgBytes[3],
+                             btdi.Address.rgBytes[2], btdi.Address.rgBytes[1], btdi.Address.rgBytes[0]);
+
+                    // Duplicate the radio handle for each device, so that we can cleanup better, and each
+                    // device gets its instance
+                    DuplicateHandle(process_handle, radio_handle, process_handle, &clone_radio_handle, 0,
+                                    TRUE, DUPLICATE_SAME_ACCESS);
+
+                    WIIMOTE_ENABLE_STATE(wm[wiimotes_count], WIIMOTE_STATE_DEV_FOUND);
+                    wm[wiimotes_count]->btdi         = btdi;
+                    wm[wiimotes_count]->radio_handle = clone_radio_handle;
+                    wm[wiimotes_count]->type         = wiimote_type;
+
+                    WIIUSE_INFO("Found wiimote (type: %s) (%s) [id %i].", wiimote_type_str, wiimote_addr_str,
+                                wm[wiimotes_count]->unid);
+
+                    wiimotes_count++;
+                }
+
+            } while (BluetoothFindNextDevice(device_enumerator, &btdi) != FALSE
+                     && wiimotes_count < max_wiimotes);
+            BluetoothFindDeviceClose(device_enumerator);
+
+        } while (BluetoothFindNextRadio(radio_enumerator, &radio_handle) != FALSE
+                 && wiimotes_count < max_wiimotes);
+        BluetoothFindRadioClose(radio_enumerator);
+        CloseHandle(radio_handle);
     }
 
-    if (detail_data)
-    {
-        free(detail_data);
-    }
-
-    SetupDiDestroyDeviceInfoList(device_info);
-
-    return found;
+    return wiimotes_count;
 }
 
 int wiiuse_os_connect(struct wiimote_t **wm, int wiimotes)
 {
-    int connected = 0;
-    int i         = 0;
+    GUID hid_guid;
+    HDEVINFO devinfos;
+    SP_DEVICE_INTERFACE_DATA device_data;
+    SP_DEVINFO_DATA devinfo_data;
+    SP_DEVICE_INTERFACE_DETAIL_DATA_W *device_detail_data = NULL;
+    HIDD_ATTRIBUTES hid_attributes;
 
-    for (; i < wiimotes; ++i)
+    HANDLE device_handle = INVALID_HANDLE_VALUE;
+    WCHAR parent[256];
+    WCHAR address_str[13]; // 12 digits + terminator
+    DEVPROPTYPE parent_type;
+    DWORD len;
+
+    int i, ii;
+    int wiimotes_count = 0;
+
+    device_data.cbSize  = sizeof(SP_DEVICE_INTERFACE_DATA);
+    devinfo_data.cbSize = sizeof(SP_DEVINFO_DATA);
+    hid_attributes.Size = sizeof(HIDD_ATTRIBUTES);
+
+    // Connect all of the devices
+    for (i = 0; i < wiimotes; i++)
+        if (WIIMOTE_IS_SET(wm[i], WIIMOTE_STATE_DEV_FOUND))
+            BluetoothSetServiceState(wm[i]->radio_handle, &wm[i]->btdi,
+                                     &HumanInterfaceDeviceServiceClass_UUID, BLUETOOTH_SERVICE_ENABLE);
+
+    HidD_GetHidGuid(&hid_guid);
+
+    devinfos = SetupDiGetClassDevsW(&hid_guid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    for (i = 0;
+         SetupDiEnumDeviceInterfaces(devinfos, NULL, &hid_guid, i, &device_data) && wiimotes_count < wiimotes;
+         i++)
     {
-        if (!wm[i])
+        if (device_detail_data)
         {
-            continue;
+            free(device_detail_data);
+            device_detail_data = NULL;
         }
-        if (WIIMOTE_IS_SET(wm[i], WIIMOTE_STATE_CONNECTED))
+
+        if (device_handle != INVALID_HANDLE_VALUE)
         {
-            ++connected;
+            CloseHandle(device_handle);
+            device_handle = INVALID_HANDLE_VALUE;
+        }
+
+        SetupDiGetDeviceInterfaceDetailW(devinfos, &device_data, NULL, 0, &len, NULL);
+
+        device_detail_data         = (SP_DEVICE_INTERFACE_DETAIL_DATA_W *)malloc(len);
+        device_detail_data->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+
+        if (SetupDiGetDeviceInterfaceDetailW(devinfos, &device_data, device_detail_data, len, NULL,
+                                             &devinfo_data)
+            == FALSE)
+            continue;
+
+        device_handle = CreateFileW(device_detail_data->DevicePath, GENERIC_READ | GENERIC_WRITE,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                                    FILE_FLAG_OVERLAPPED, NULL);
+        if (device_handle == INVALID_HANDLE_VALUE)
+            continue;
+
+        HidD_GetAttributes(device_handle, &hid_attributes);
+        if (hid_attributes.VendorID != WM_VENDOR_ID
+            || (hid_attributes.ProductID != WM_PRODUCT_ID && hid_attributes.ProductID != WM_PRODUCT_ID_TR))
+            continue;
+
+        // This is a wiimote
+
+        // Get the device parent string (wich should contain the MAC somewhere)
+        if (SetupDiGetDevicePropertyW(devinfos, &devinfo_data, &DEVPKEY_Device_Parent, &parent_type,
+                                      (PBYTE)parent, sizeof(parent), NULL, 0)
+            != TRUE)
+            continue;
+
+        for (ii = 0; ii < wiimotes; ii++)
+        {
+            if (WIIMOTE_IS_SET(wm[ii], WIIMOTE_STATE_DEV_FOUND))
+            {
+                // Generate the MAC string (windows stores it in reverse order)
+                wsprintfW(address_str, L"%02X%02X%02X%02X%02X%02X", wm[ii]->btdi.Address.rgBytes[5],
+                          wm[ii]->btdi.Address.rgBytes[4], wm[ii]->btdi.Address.rgBytes[3],
+                          wm[ii]->btdi.Address.rgBytes[2], wm[ii]->btdi.Address.rgBytes[1],
+                          wm[ii]->btdi.Address.rgBytes[0]);
+
+                if (wcsstr(parent, address_str) != NULL)
+                {
+                    // The MAC matches
+
+                    wm[ii]->dev_handle             = device_handle;
+                    wm[ii]->hid_overlap.hEvent     = CreateEvent(NULL, 1, 1, "");
+                    wm[ii]->hid_overlap.Offset     = 0;
+                    wm[ii]->hid_overlap.OffsetHigh = 0;
+
+                    device_handle = INVALID_HANDLE_VALUE;
+
+                    WIIMOTE_ENABLE_STATE(wm[ii], WIIMOTE_STATE_CONNECTED);
+
+                    /* try to set the output report to see if the device is actually connected */
+                    if (!wiiuse_set_report_type(wm[ii]))
+                    {
+                        WIIMOTE_DISABLE_STATE(wm[ii], WIIMOTE_STATE_CONNECTED);
+                        continue;
+                    }
+
+                    WIIUSE_INFO("Connected to wiimote [id %i].", wm[ii]->unid);
+
+                    /* do the handshake */
+                    wiiuse_handshake(wm[ii], NULL, 0);
+
+                    wiimotes_count++;
+                }
+            }
         }
     }
 
-    return connected;
+    // If we haven't found the corresponding handle then disconnect the wiimote
+    for (i = 0; i < wiimotes; i++)
+        if (WIIMOTE_IS_SET(wm[i], WIIMOTE_STATE_DEV_FOUND) && !WIIMOTE_IS_CONNECTED(wm[i]))
+            BluetoothSetServiceState(wm[i]->radio_handle, &wm[i]->btdi,
+                                     &HumanInterfaceDeviceServiceClass_UUID, BLUETOOTH_SERVICE_DISABLE);
+
+    if (device_detail_data)
+        free(device_detail_data);
+
+    if (device_handle != INVALID_HANDLE_VALUE)
+        CloseHandle(device_handle);
+
+    SetupDiDestroyDeviceInfoList(devinfos);
+
+    return wiimotes_count;
 }
 
 void wiiuse_os_disconnect(struct wiimote_t *wm)
 {
     if (!wm || WIIMOTE_IS_CONNECTED(wm))
-    {
         return;
-    }
+
+    // Shut down the bluetooth connection
+    BluetoothSetServiceState(wm->radio_handle, &wm->btdi, &HumanInterfaceDeviceServiceClass_UUID,
+                             BLUETOOTH_SERVICE_DISABLE);
+
+    CloseHandle(wm->radio_handle);
+    wm->dev_handle = INVALID_HANDLE_VALUE;
 
     CloseHandle(wm->dev_handle);
-    wm->dev_handle = 0;
+    wm->dev_handle = INVALID_HANDLE_VALUE;
 
     ResetEvent(&wm->hid_overlap);
 
@@ -354,14 +486,19 @@ int wiiuse_os_write(struct wiimote_t *wm, byte report_type, byte *buf, int len)
 
 void wiiuse_init_platform_fields(struct wiimote_t *wm)
 {
-    wm->dev_handle     = 0;
+    wm->dev_handle     = INVALID_HANDLE_VALUE;
+    wm->radio_handle   = INVALID_HANDLE_VALUE;
     wm->stack          = WIIUSE_STACK_UNKNOWN;
     wm->normal_timeout = WIIMOTE_DEFAULT_TIMEOUT;
     wm->exp_timeout    = WIIMOTE_EXP_TIMEOUT;
     wm->timeout        = wm->normal_timeout;
 }
 
-void wiiuse_cleanup_platform_fields(struct wiimote_t *wm) { wm->dev_handle = 0; }
+void wiiuse_cleanup_platform_fields(struct wiimote_t *wm)
+{
+    wm->dev_handle   = INVALID_HANDLE_VALUE;
+    wm->radio_handle = INVALID_HANDLE_VALUE;
+}
 
 unsigned long wiiuse_os_ticks()
 {

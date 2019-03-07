@@ -171,6 +171,10 @@
 #define WM_PRODUCT_ID             0x0306    // Regular wiimote
 #define WM_PRODUCT_ID_TR          0x0330 // RVL-CNT-01-TR Wiimote (with MotionPlus built-in)
 
+/* windows bluetooth inquiry names */
+#define WM_LONG_NAME              L"Nintendo RVL-CNT-01"
+#define WM_LONG_NAME_TR           L"Nintendo RVL-CNT-01-TR"
+
 /* controller status stuff */
 #define WM_MAX_BATTERY_CODE       0xC8
 
